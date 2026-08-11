@@ -1,0 +1,12 @@
+{
+  "credentialsFile": "./private/logpass.txt",
+  "maFileDirectories": [
+    "./private/maFiles"
+  ],
+  "authCacheFile": "./private/data/client-refresh-tokens.json",
+  "steamDataDirectory": "./private/data/steam-user",
+  "profileRequestTimeoutMs": 20000,
+  "minRequestIntervalMs": 1200,
+  "reconnectBaseDelayMs": 5000,
+  "reconnectMaxDelayMs": 60000
+}

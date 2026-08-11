@@ -1,0 +1,33 @@
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 5055,
+    "apiKeyEnv": "SWI_STATS_API_KEY",
+    "requireApiKey": true
+  },
+  "statsWorker": {
+    "command": [
+      "node",
+      "stats.js",
+      "--stdio",
+      "--config",
+      "stats-worker-config.json",
+      "--account",
+      "{account}"
+    ],
+    "accounts": [
+      "worker_account_1",
+      "worker_account_2"
+    ],
+    "requestTimeoutSeconds": 40,
+    "restartDelaySeconds": 3
+  },
+  "pool": {
+    "maxQueueSize": 10000,
+    "maxAttemptsPerJob": 3,
+    "retryDelaySeconds": 1,
+    "resultCacheTtlSeconds": 300,
+    "maxCacheEntries": 20000,
+    "jobTtlSeconds": 600
+  }
+}

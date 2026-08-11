@@ -1,0 +1,11 @@
+{
+  "name": "swi-steam-stats-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Persistent Steam GC worker launched by the Python stats server.",
+  "type": "commonjs",
+  "dependencies": {
+    "node-cs2": "^2.3.1",
+    "steam-user": "^5.3.0"
+  }
+}
