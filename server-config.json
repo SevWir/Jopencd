@@ -16,8 +16,23 @@
       "{account}"
     ],
     "accounts": [
-      "worker_account_1",
-      "worker_account_2"
+      "seviq_el1",
+      "seviq_el2",
+      "seviq_el3",
+      "seviq_el4",
+      "seviq_el5",
+      "seviq_el6",
+      "seviq_el9",
+      "seviq_el10",
+      "socjkseqvw",
+      "seqverscs",
+      "kolseioprserq",
+      "keskovalevsksc",
+      "elenapasercodicsg",
+      "overshtauntscrerv",
+      "ovalenkoviekcs",
+      "viktnimathercsgis",
+      "inkvatoridcsgq"
     ],
     "requestTimeoutSeconds": 40,
     "restartDelaySeconds": 3

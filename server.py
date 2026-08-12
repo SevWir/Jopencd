@@ -138,6 +138,7 @@ def normalize_steam_id(value: Any) -> str:
     return steam_id
 
 
+
 def load_config(config_path: Path) -> dict[str, Any]:
     if not config_path.is_file():
         raise ConfigurationError(
