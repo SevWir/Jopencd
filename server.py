@@ -34,9 +34,12 @@ from urllib.parse import urlparse
 LOGGER = logging.getLogger("steam_stats_server")
 MAX_STEAM_ID_LENGTH = 17
 MIN_STEAM_ID_LENGTH = 17
+MAX_REMOTE_WORKER_ID_LENGTH = 80
+MAX_REMOTE_ACCOUNT_NAME_LENGTH = 128
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
+    "workerMode": "local",
     "server": {
         "host": "0.0.0.0",
         "port": 19222,
@@ -60,6 +63,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "requestTimeoutSeconds": 40,
         "restartDelaySeconds": 3,
     },
+    "remoteWorkers": {
+        "workerApiKeyEnv": "SWI_STATS_WORKER_API_KEY",
+        "maxWorkers": 32,
+        "jobLeaseSeconds": 75,
+    },
+    "provisioning": {
+        "enabled": False,
+        "provisionKeyEnv": "SWI_STATS_PROVISION_KEY",
+        "tokenCacheFile": "./private/data/client-refresh-tokens.json",
+    },
     "pool": {
         "maxQueueSize": 10_000,
         "maxAttemptsPerJob": 3,
@@ -81,6 +94,14 @@ class QueueFullError(RuntimeError):
 
 class WorkerProtocolError(RuntimeError):
     """Raised when a stats worker emits invalid JSON Lines protocol data."""
+
+
+class RemoteWorkerLimitError(RuntimeError):
+    """Raised when a remote worker registration exceeds the configured limit."""
+
+
+class RemoteWorkerLeaseError(RuntimeError):
+    """Raised when a remote worker tries to change another worker's job."""
 
 
 def utc_now() -> str:
@@ -138,6 +159,23 @@ def normalize_steam_id(value: Any) -> str:
     return steam_id
 
 
+def normalize_remote_worker_id(value: Any) -> str:
+    worker_id = str(value or "").strip()
+    if (
+        not worker_id
+        or len(worker_id) > MAX_REMOTE_WORKER_ID_LENGTH
+        or any(character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_." for character in worker_id)
+    ):
+        raise ValueError("agentId must contain only letters, numbers, '-', '_' or '.'.")
+    return worker_id
+
+
+def normalize_remote_account_name(value: Any) -> str:
+    account_name = str(value or "").strip()
+    if not account_name or len(account_name) > MAX_REMOTE_ACCOUNT_NAME_LENGTH:
+        raise ValueError("accountName must be between 1 and 128 characters.")
+    return account_name
+
 
 def load_config(config_path: Path) -> dict[str, Any]:
     if not config_path.is_file():
@@ -159,7 +197,14 @@ def load_config(config_path: Path) -> dict[str, Any]:
 
     server_config = config["server"]
     worker_config = config["statsWorker"]
+    remote_worker_config = config["remoteWorkers"]
+    provisioning_config = config["provisioning"]
     pool_config = config["pool"]
+
+    worker_mode = str(config.get("workerMode", "local")).strip().lower()
+    if worker_mode not in {"local", "remote"}:
+        raise ConfigurationError("workerMode must be either 'local' or 'remote'.")
+    config["workerMode"] = worker_mode
 
     server_config["port"] = as_positive_integer(server_config["port"], "server.port")
     server_config["maxRequestBodyBytes"] = as_positive_integer(
@@ -172,25 +217,56 @@ def load_config(config_path: Path) -> dict[str, Any]:
         server_config["maxSynchronousWaitSeconds"], "server.maxSynchronousWaitSeconds", allow_zero=True
     )
 
-    command = worker_config.get("command")
-    if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
-        raise ConfigurationError("statsWorker.command must be a non-empty JSON string array.")
-    worker_config["command"] = command
-    worker_config["requestTimeoutSeconds"] = as_positive_number(
-        worker_config["requestTimeoutSeconds"], "statsWorker.requestTimeoutSeconds"
-    )
-    worker_config["restartDelaySeconds"] = as_positive_number(
-        worker_config["restartDelaySeconds"], "statsWorker.restartDelaySeconds", allow_zero=True
-    )
+    if worker_mode == "local":
+        command = worker_config.get("command")
+        if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
+            raise ConfigurationError("statsWorker.command must be a non-empty JSON string array.")
+        worker_config["command"] = command
+        worker_config["requestTimeoutSeconds"] = as_positive_number(
+            worker_config["requestTimeoutSeconds"], "statsWorker.requestTimeoutSeconds"
+        )
+        worker_config["restartDelaySeconds"] = as_positive_number(
+            worker_config["restartDelaySeconds"], "statsWorker.restartDelaySeconds", allow_zero=True
+        )
 
-    account_names = worker_config.get("accounts")
-    if not isinstance(account_names, list):
-        raise ConfigurationError("statsWorker.accounts must be a JSON array.")
-    worker_config["accounts"] = list(
-        dict.fromkeys(str(account_name).strip() for account_name in account_names if str(account_name).strip())
-    )
-    if not worker_config["accounts"]:
-        raise ConfigurationError("statsWorker.accounts must contain at least one local worker account name.")
+        account_names = worker_config.get("accounts")
+        if not isinstance(account_names, list):
+            raise ConfigurationError("statsWorker.accounts must be a JSON array.")
+        worker_config["accounts"] = list(
+            dict.fromkeys(str(account_name).strip() for account_name in account_names if str(account_name).strip())
+        )
+        if not worker_config["accounts"]:
+            raise ConfigurationError("statsWorker.accounts must contain at least one local worker account name.")
+
+        provisioning_config["enabled"] = bool(provisioning_config.get("enabled", False))
+        if provisioning_config["enabled"]:
+            provision_key_env = str(provisioning_config.get("provisionKeyEnv", "")).strip()
+            token_cache_file = str(provisioning_config.get("tokenCacheFile", "")).strip()
+            if not provision_key_env:
+                raise ConfigurationError("provisioning.provisionKeyEnv is required when provisioning is enabled.")
+            if not os.environ.get(provision_key_env):
+                raise ConfigurationError(
+                    f"Environment variable {provision_key_env} is required when provisioning is enabled."
+                )
+            if not token_cache_file:
+                raise ConfigurationError("provisioning.tokenCacheFile is required when provisioning is enabled.")
+            provisioning_config["provisionKeyEnv"] = provision_key_env
+            provisioning_config["tokenCacheFile"] = token_cache_file
+    else:
+        worker_api_key_env = str(remote_worker_config.get("workerApiKeyEnv", "")).strip()
+        if not worker_api_key_env:
+            raise ConfigurationError("remoteWorkers.workerApiKeyEnv is required for remote workers.")
+        if not os.environ.get(worker_api_key_env):
+            raise ConfigurationError(
+                f"Environment variable {worker_api_key_env} is required for remote workers."
+            )
+        remote_worker_config["workerApiKeyEnv"] = worker_api_key_env
+        remote_worker_config["maxWorkers"] = as_positive_integer(
+            remote_worker_config["maxWorkers"], "remoteWorkers.maxWorkers"
+        )
+        remote_worker_config["jobLeaseSeconds"] = as_positive_number(
+            remote_worker_config["jobLeaseSeconds"], "remoteWorkers.jobLeaseSeconds"
+        )
 
     for setting_name in ("maxQueueSize", "maxAttemptsPerJob", "maxCacheEntries", "jobTtlSeconds"):
         pool_config[setting_name] = as_positive_integer(pool_config[setting_name], f"pool.{setting_name}")
@@ -240,6 +316,34 @@ class XpJob:
 @dataclass
 class CachedResult:
     result: dict[str, Any]
+    expires_at: float
+
+
+@dataclass
+class RemoteWorker:
+    worker_id: str
+    account_name: str
+    state: str = "starting"
+    last_error: str | None = None
+    last_seen_at: str = field(default_factory=utc_now)
+    last_seen_monotonic: float = field(default_factory=time.monotonic, repr=False)
+    active_job_id: str | None = None
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "agentId": self.worker_id,
+            "accountName": self.account_name,
+            "state": self.state,
+            "lastError": self.last_error,
+            "lastSeenAt": self.last_seen_at,
+            "activeJobId": self.active_job_id,
+        }
+
+
+@dataclass
+class RemoteJobLease:
+    worker_id: str
+    token: str
     expires_at: float
 
 
@@ -464,6 +568,7 @@ class XpWorkerPool:
         self._cache: collections.OrderedDict[str, CachedResult] = collections.OrderedDict()
         self._busy_workers: set[int] = set()
         self._round_robin_index = 0
+        self._dispatch_retry_timer: threading.Timer | None = None
         self._lock = threading.RLock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=len(workers), thread_name_prefix="xp-worker"
@@ -478,8 +583,13 @@ class XpWorkerPool:
                 LOGGER.warning("Worker %s did not start yet: %s", worker.account_name, error)
 
     def stop(self) -> None:
+        retry_timer = None
         with self._lock:
             self._stopped = True
+            retry_timer = self._dispatch_retry_timer
+            self._dispatch_retry_timer = None
+        if retry_timer is not None:
+            retry_timer.cancel()
         for worker in self._workers:
             worker.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -563,6 +673,10 @@ class XpWorkerPool:
         while self._queue:
             worker_index = self._next_available_worker_index_locked()
             if worker_index is None:
+                # Do not hand jobs to workers that are still connecting/cooling down.
+                # Keep the jobs queued and retry shortly; as soon as any worker becomes
+                # READY, that worker will start draining the queue.
+                self._schedule_dispatch_retry_locked()
                 return
 
             job = self._queue.popleft()
@@ -576,12 +690,44 @@ class XpWorkerPool:
             self._executor.submit(self._run_job, worker_index, job)
 
     def _next_available_worker_index_locked(self) -> int | None:
-        for offset in range(len(self._workers)):
-            worker_index = (self._round_robin_index + offset) % len(self._workers)
-            if worker_index not in self._busy_workers:
-                self._round_robin_index = (worker_index + 1) % len(self._workers)
-                return worker_index
+        worker_count = len(self._workers)
+        if worker_count == 0:
+            return None
+
+        for offset in range(worker_count):
+            worker_index = (self._round_robin_index + offset) % worker_count
+            if worker_index in self._busy_workers:
+                continue
+
+            worker = self._workers[worker_index]
+            # Test/dummy workers may not expose a state property; treat them as ready.
+            if str(getattr(worker, "state", "ready")).strip().lower() != "ready":
+                continue
+
+            self._round_robin_index = (worker_index + 1) % worker_count
+            return worker_index
+
         return None
+
+    def _schedule_dispatch_retry_locked(self) -> None:
+        if self._stopped or not self._queue:
+            return
+
+        current_timer = self._dispatch_retry_timer
+        if current_timer is not None and current_timer.is_alive():
+            return
+
+        retry_timer = threading.Timer(0.5, self._retry_dispatch)
+        retry_timer.daemon = True
+        self._dispatch_retry_timer = retry_timer
+        retry_timer.start()
+
+    def _retry_dispatch(self) -> None:
+        with self._lock:
+            self._dispatch_retry_timer = None
+            if self._stopped:
+                return
+            self._dispatch_locked()
 
     def _run_job(self, worker_index: int, job: XpJob) -> None:
         worker = self._workers[worker_index]
@@ -660,24 +806,421 @@ class XpWorkerPool:
             self._jobs.pop(job_id, None)
 
 
+class RemoteXpWorkerPool:
+    """FIFO queue served by authenticated agents that run outside the HTTP server."""
+
+    def __init__(self, pool_config: dict[str, Any], remote_worker_config: dict[str, Any]) -> None:
+        self._config = pool_config
+        self._remote_worker_config = remote_worker_config
+        self._queue: collections.deque[XpJob] = collections.deque()
+        self._jobs: dict[str, XpJob] = {}
+        self._pending_by_steam_id: dict[str, XpJob] = {}
+        self._cache: collections.OrderedDict[str, CachedResult] = collections.OrderedDict()
+        self._workers: dict[str, RemoteWorker] = {}
+        self._leases: dict[str, RemoteJobLease] = {}
+        self._lock = threading.RLock()
+        self._stopped = False
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        with self._lock:
+            self._stopped = True
+            self._queue.clear()
+            self._leases.clear()
+            for worker in self._workers.values():
+                worker.active_job_id = None
+            for job in self._pending_by_steam_id.values():
+                if job.state not in {"completed", "failed"}:
+                    job.state = "failed"
+                    job.error = "Stats server stopped."
+                    job.finished_at = utc_now()
+                    job.completed.set()
+            self._pending_by_steam_id.clear()
+
+    def submit(self, steam_id: str) -> XpJob:
+        return self.submit_many([steam_id])[0]
+
+    def submit_many(self, steam_ids: list[str]) -> list[XpJob]:
+        normalized_steam_ids = list(dict.fromkeys(normalize_steam_id(steam_id) for steam_id in steam_ids))
+        if not normalized_steam_ids:
+            return []
+
+        with self._lock:
+            self._prune_locked()
+            new_steam_ids = [
+                steam_id
+                for steam_id in normalized_steam_ids
+                if steam_id not in self._cache and steam_id not in self._pending_by_steam_id
+            ]
+            if len(self._queue) + len(new_steam_ids) > self._config["maxQueueSize"]:
+                raise QueueFullError(f"The request queue is full ({self._config['maxQueueSize']}).")
+
+            jobs = []
+            for steam_id in normalized_steam_ids:
+                cached = self._cache.get(steam_id)
+                if cached is not None:
+                    job = XpJob(steam_id=steam_id, cached=True, state="completed")
+                    job.result = {**cached.result, "cached": True}
+                    job.finished_at = utc_now()
+                    job.completed.set()
+                    self._jobs[job.id] = job
+                    jobs.append(job)
+                    continue
+
+                pending = self._pending_by_steam_id.get(steam_id)
+                if pending is not None:
+                    jobs.append(pending)
+                    continue
+
+                job = XpJob(steam_id=steam_id)
+                self._queue.append(job)
+                self._jobs[job.id] = job
+                self._pending_by_steam_id[steam_id] = job
+                jobs.append(job)
+
+            return jobs
+
+    def get_job(self, job_id: str) -> XpJob | None:
+        with self._lock:
+            self._prune_locked()
+            return self._jobs.get(job_id)
+
+    def get_job_payload(self, job: XpJob) -> dict[str, Any]:
+        with self._lock:
+            queue_position = None
+            if job.state == "queued":
+                try:
+                    queue_position = list(self._queue).index(job) + 1
+                except ValueError:
+                    queue_position = None
+            return job.to_public(queue_position)
+
+    def get_status(self) -> dict[str, Any]:
+        with self._lock:
+            self._prune_locked()
+            return {
+                "queuedJobs": len(self._queue),
+                "pendingJobs": len(self._pending_by_steam_id),
+                "cachedResults": len(self._cache),
+                "workers": [worker.status() for worker in sorted(self._workers.values(), key=lambda item: item.worker_id)],
+                "activeLeases": len(self._leases),
+            }
+
+    def wait_for_job(self, job: XpJob, timeout_seconds: float) -> None:
+        job.completed.wait(timeout=max(0.0, timeout_seconds))
+
+    def register_worker(
+        self,
+        worker_id: Any,
+        account_name: Any,
+        state: Any = "starting",
+        error: Any = None,
+    ) -> RemoteWorker:
+        normalized_worker_id = normalize_remote_worker_id(worker_id)
+        normalized_account_name = normalize_remote_account_name(account_name)
+        normalized_state = str(state or "unknown").strip().lower() or "unknown"
+        normalized_error = str(error).strip() if error is not None else ""
+
+        with self._lock:
+            self._prune_locked()
+            return self._register_worker_locked(
+                normalized_worker_id,
+                normalized_account_name,
+                normalized_state,
+                normalized_error or None,
+            )
+
+    def claim_next_job(
+        self,
+        worker_id: Any,
+        account_name: Any,
+        state: Any = "ready",
+        error: Any = None,
+    ) -> dict[str, Any] | None:
+        normalized_worker_id = normalize_remote_worker_id(worker_id)
+        normalized_account_name = normalize_remote_account_name(account_name)
+        normalized_state = str(state or "unknown").strip().lower() or "unknown"
+        normalized_error = str(error).strip() if error is not None else ""
+
+        with self._lock:
+            self._prune_locked()
+            worker = self._register_worker_locked(
+                normalized_worker_id,
+                normalized_account_name,
+                normalized_state,
+                normalized_error or None,
+            )
+            if self._stopped:
+                return None
+
+            if worker.active_job_id:
+                active_job = self._jobs.get(worker.active_job_id)
+                active_lease = self._leases.get(worker.active_job_id)
+                if active_job is not None and active_job.state == "running" and active_lease is not None:
+                    return self._to_assignment_payload(active_job, active_lease)
+                worker.active_job_id = None
+
+            if worker.state != "ready":
+                return None
+
+            while self._queue:
+                job = self._queue.popleft()
+                if job.state != "queued":
+                    continue
+
+                job.state = "running"
+                job.started_at = utc_now()
+                job.attempts += 1
+                lease = RemoteJobLease(
+                    worker_id=worker.worker_id,
+                    token=str(uuid.uuid4()),
+                    expires_at=time.monotonic() + self._remote_worker_config["jobLeaseSeconds"],
+                )
+                self._leases[job.id] = lease
+                worker.active_job_id = job.id
+                worker.state = "busy"
+                worker.last_error = None
+                return self._to_assignment_payload(job, lease)
+
+            return None
+
+    def complete_job(self, worker_id: Any, job_id: Any, lease_token: Any, result: Any) -> XpJob:
+        normalized_worker_id = normalize_remote_worker_id(worker_id)
+        normalized_job_id = str(job_id or "").strip()
+        normalized_lease_token = str(lease_token or "").strip()
+
+        with self._lock:
+            self._prune_locked()
+            job, worker = self._validate_lease_locked(
+                normalized_worker_id,
+                normalized_job_id,
+                normalized_lease_token,
+            )
+            normalized_result = self._normalize_result(job, result)
+            self._leases.pop(job.id, None)
+            worker.active_job_id = None
+            worker.state = "ready"
+            worker.last_error = None
+            job.state = "completed"
+            job.result = normalized_result
+            job.error = None
+            job.finished_at = utc_now()
+            job.completed.set()
+            self._pending_by_steam_id.pop(job.steam_id, None)
+            self._cache[job.steam_id] = CachedResult(
+                result=normalized_result,
+                expires_at=time.monotonic() + self._config["resultCacheTtlSeconds"],
+            )
+            self._cache.move_to_end(job.steam_id)
+            while len(self._cache) > self._config["maxCacheEntries"]:
+                self._cache.popitem(last=False)
+            return job
+
+    def fail_job(
+        self,
+        worker_id: Any,
+        job_id: Any,
+        lease_token: Any,
+        error: Any,
+        state: Any = "cooldown",
+    ) -> XpJob:
+        normalized_worker_id = normalize_remote_worker_id(worker_id)
+        normalized_job_id = str(job_id or "").strip()
+        normalized_lease_token = str(lease_token or "").strip()
+        detail = str(error or "Remote worker could not complete the job.").strip()
+        normalized_state = str(state or "cooldown").strip().lower() or "cooldown"
+
+        with self._lock:
+            self._prune_locked()
+            job, worker = self._validate_lease_locked(
+                normalized_worker_id,
+                normalized_job_id,
+                normalized_lease_token,
+            )
+            self._leases.pop(job.id, None)
+            worker.active_job_id = None
+            worker.state = normalized_state
+            worker.last_error = detail
+            self._finish_error_locked(job, detail)
+            return job
+
+    def _register_worker_locked(
+        self,
+        worker_id: str,
+        account_name: str,
+        state: str,
+        error: str | None,
+    ) -> RemoteWorker:
+        worker = self._workers.get(worker_id)
+        if worker is None:
+            if len(self._workers) >= self._remote_worker_config["maxWorkers"]:
+                raise RemoteWorkerLimitError(
+                    f"The remote worker limit is {self._remote_worker_config['maxWorkers']}."
+                )
+            worker = RemoteWorker(worker_id=worker_id, account_name=account_name)
+            self._workers[worker_id] = worker
+        elif worker.account_name != account_name:
+            raise RemoteWorkerLeaseError("agentId is already registered for another accountName.")
+
+        worker.state = state
+        worker.last_error = error
+        worker.last_seen_at = utc_now()
+        worker.last_seen_monotonic = time.monotonic()
+        return worker
+
+    def _to_assignment_payload(self, job: XpJob, lease: RemoteJobLease) -> dict[str, Any]:
+        return {
+            "id": job.id,
+            "steamId": job.steam_id,
+            "leaseToken": lease.token,
+            "leaseSeconds": self._remote_worker_config["jobLeaseSeconds"],
+        }
+
+    def _validate_lease_locked(
+        self,
+        worker_id: str,
+        job_id: str,
+        lease_token: str,
+    ) -> tuple[XpJob, RemoteWorker]:
+        job = self._jobs.get(job_id)
+        lease = self._leases.get(job_id)
+        worker = self._workers.get(worker_id)
+        if job is None or lease is None or worker is None:
+            raise RemoteWorkerLeaseError("The job lease is missing or has expired.")
+        if lease.worker_id != worker_id or not hmac.compare_digest(lease.token, lease_token):
+            raise RemoteWorkerLeaseError("The job lease does not belong to this agent.")
+        if job.state != "running" or worker.active_job_id != job.id:
+            raise RemoteWorkerLeaseError("The job is not active for this agent.")
+        return job, worker
+
+    def _normalize_result(self, job: XpJob, result: Any) -> dict[str, Any]:
+        if not isinstance(result, dict):
+            raise ValueError("Worker result must be a JSON object.")
+        result_steam_id = normalize_steam_id(result.get("steamId"))
+        if result_steam_id != job.steam_id:
+            raise ValueError("Worker result steamId does not match the assigned job.")
+
+        try:
+            current_xp = int(result.get("currentXp"))
+            xp_per_level = int(result.get("xpPerLevel", 5000))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Worker result contains invalid XP values.") from error
+        if current_xp < 0 or xp_per_level <= 0 or current_xp > xp_per_level:
+            raise ValueError("Worker result XP values are out of range.")
+
+        profile_level = result.get("profileLevel")
+        try:
+            profile_level = int(profile_level) if profile_level is not None else None
+        except (TypeError, ValueError):
+            profile_level = None
+
+        fetched_at = str(result.get("fetchedAt") or utc_now()).strip() or utc_now()
+        return {
+            "steamId": job.steam_id,
+            "currentXp": current_xp,
+            "xpPerLevel": xp_per_level,
+            "progressPercent": round((current_xp / xp_per_level) * 100, 2),
+            "xpRemaining": xp_per_level - current_xp,
+            "profileLevel": profile_level,
+            "fetchedAt": fetched_at,
+        }
+
+    def _finish_error_locked(self, job: XpJob, detail: str) -> None:
+        job.error = detail
+        should_retry = not self._stopped and job.attempts < self._config["maxAttemptsPerJob"]
+        if should_retry:
+            job.state = "queued"
+            threading.Timer(self._config["retryDelaySeconds"], self._requeue_job, args=(job,)).start()
+            return
+
+        job.state = "failed"
+        job.finished_at = utc_now()
+        job.completed.set()
+        self._pending_by_steam_id.pop(job.steam_id, None)
+
+    def _requeue_job(self, job: XpJob) -> None:
+        with self._lock:
+            if self._stopped or job.state != "queued":
+                return
+            self._queue.append(job)
+
+    def _prune_locked(self) -> None:
+        now = time.monotonic()
+        expired_steam_ids = [
+            steam_id for steam_id, entry in self._cache.items() if entry.expires_at <= now
+        ]
+        for steam_id in expired_steam_ids:
+            self._cache.pop(steam_id, None)
+
+        expired_job_ids = [
+            job_id for job_id, lease in self._leases.items() if lease.expires_at <= now
+        ]
+        for job_id in expired_job_ids:
+            lease = self._leases.pop(job_id, None)
+            job = self._jobs.get(job_id)
+            if lease is None or job is None or job.state != "running":
+                continue
+            worker = self._workers.get(lease.worker_id)
+            if worker is not None:
+                worker.active_job_id = None
+                worker.state = "offline"
+                worker.last_error = "Job lease expired."
+            self._finish_error_locked(job, "Remote worker lease expired.")
+
+        stale_after_seconds = max(60.0, self._remote_worker_config["jobLeaseSeconds"] * 2)
+        stale_worker_ids = [
+            worker_id
+            for worker_id, worker in self._workers.items()
+            if worker.active_job_id is None and now - worker.last_seen_monotonic > stale_after_seconds
+        ]
+        for worker_id in stale_worker_ids:
+            self._workers.pop(worker_id, None)
+
+        job_ttl = self._config["jobTtlSeconds"]
+        if job_ttl <= 0:
+            return
+
+        cutoff = time.time() - job_ttl
+        stale_job_ids = []
+        for job_id, job in self._jobs.items():
+            if not job.finished_at:
+                continue
+            try:
+                finished_timestamp = calendar.timegm(time.strptime(job.finished_at, "%Y-%m-%dT%H:%M:%SZ"))
+            except ValueError:
+                continue
+            if finished_timestamp <= cutoff:
+                stale_job_ids.append(job_id)
+        for job_id in stale_job_ids:
+            self._jobs.pop(job_id, None)
+
+
 class ServerRuntime:
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
-        worker_config = config["statsWorker"]
-        runtime_directory = Path(config["runtimeDirectory"])
-        workers = [
-            StatsWorkerProcess(
-                account_name=account_name,
-                command_template=worker_config["command"],
-                working_directory=runtime_directory,
-                request_timeout_seconds=worker_config["requestTimeoutSeconds"],
-                restart_delay_seconds=worker_config["restartDelaySeconds"],
-            )
-            for account_name in worker_config["accounts"]
-        ]
-        self.pool = XpWorkerPool(workers, config["pool"])
+        self.worker_mode = str(config.get("workerMode", "local"))
+        if self.worker_mode == "local":
+            worker_config = config["statsWorker"]
+            runtime_directory = Path(config["runtimeDirectory"])
+            workers = [
+                StatsWorkerProcess(
+                    account_name=account_name,
+                    command_template=worker_config["command"],
+                    working_directory=runtime_directory,
+                    request_timeout_seconds=worker_config["requestTimeoutSeconds"],
+                    restart_delay_seconds=worker_config["restartDelaySeconds"],
+                )
+                for account_name in worker_config["accounts"]
+            ]
+            self.pool: XpWorkerPool | RemoteXpWorkerPool = XpWorkerPool(workers, config["pool"])
+        else:
+            self.pool = RemoteXpWorkerPool(config["pool"], config["remoteWorkers"])
         api_key_env = str(config["server"].get("apiKeyEnv", ""))
         self.api_key = os.environ.get(api_key_env, "")
+        worker_api_key_env = str(config.get("remoteWorkers", {}).get("workerApiKeyEnv", ""))
+        self.worker_api_key = os.environ.get(worker_api_key_env, "") if self.worker_mode == "remote" else ""
 
     def is_authorized(self, supplied_key: str | None) -> bool:
         if not bool(self.config["server"].get("requireApiKey", True)):
@@ -685,6 +1228,14 @@ class ServerRuntime:
         if not supplied_key or not self.api_key:
             return False
         return hmac.compare_digest(supplied_key.encode("utf-8"), self.api_key.encode("utf-8"))
+
+    def is_remote_worker_mode(self) -> bool:
+        return self.worker_mode == "remote" and isinstance(self.pool, RemoteXpWorkerPool)
+
+    def is_worker_authorized(self, supplied_key: str | None) -> bool:
+        if not self.is_remote_worker_mode() or not supplied_key or not self.worker_api_key:
+            return False
+        return hmac.compare_digest(supplied_key.encode("utf-8"), self.worker_api_key.encode("utf-8"))
 
 
 def create_request_handler(runtime: ServerRuntime) -> type[BaseHTTPRequestHandler]:
@@ -716,6 +1267,18 @@ def create_request_handler(runtime: ServerRuntime) -> type[BaseHTTPRequestHandle
             self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Endpoint was not found.")
 
         def do_POST(self) -> None:
+            path = urlparse(self.path).path
+            if path.startswith("/v1/worker/"):
+                if not self._require_worker_authorization():
+                    return
+                try:
+                    payload = self._read_json_body()
+                except ValueError as error:
+                    self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_json", str(error))
+                    return
+                self._handle_worker_request(path, payload)
+                return
+
             if not self._require_authorization():
                 return
 
@@ -725,7 +1288,6 @@ def create_request_handler(runtime: ServerRuntime) -> type[BaseHTTPRequestHandle
                 self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_json", str(error))
                 return
 
-            path = urlparse(self.path).path
             if path == "/v1/xp":
                 self._submit_single(payload)
                 return
@@ -810,6 +1372,72 @@ def create_request_handler(runtime: ServerRuntime) -> type[BaseHTTPRequestHandle
 
             self._send_json(HTTPStatus.OK, {"jobs": jobs})
 
+        def _handle_worker_request(self, path: str, payload: dict[str, Any]) -> None:
+            if not runtime.is_remote_worker_mode():
+                self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Remote workers are disabled.")
+                return
+
+            remote_pool = runtime.pool
+            if not isinstance(remote_pool, RemoteXpWorkerPool):
+                self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Remote workers are disabled.")
+                return
+
+            try:
+                if path == "/v1/worker/register":
+                    worker = remote_pool.register_worker(
+                        payload.get("agentId"),
+                        payload.get("accountName"),
+                        payload.get("state", "starting"),
+                        payload.get("error"),
+                    )
+                    self._send_json(HTTPStatus.OK, {"ok": True, "worker": worker.status()})
+                    return
+
+                if path == "/v1/worker/next":
+                    assignment = remote_pool.claim_next_job(
+                        payload.get("agentId"),
+                        payload.get("accountName"),
+                        payload.get("state", "ready"),
+                        payload.get("error"),
+                    )
+                    self._send_json(HTTPStatus.OK, {"job": assignment})
+                    return
+
+                job_prefix = "/v1/worker/jobs/"
+                if path.startswith(job_prefix) and path.endswith("/complete"):
+                    job_id = path.removeprefix(job_prefix).removesuffix("/complete").strip("/")
+                    job = remote_pool.complete_job(
+                        payload.get("agentId"),
+                        job_id,
+                        payload.get("leaseToken"),
+                        payload.get("result"),
+                    )
+                    self._send_json(HTTPStatus.OK, {"job": remote_pool.get_job_payload(job)})
+                    return
+
+                if path.startswith(job_prefix) and path.endswith("/failed"):
+                    job_id = path.removeprefix(job_prefix).removesuffix("/failed").strip("/")
+                    job = remote_pool.fail_job(
+                        payload.get("agentId"),
+                        job_id,
+                        payload.get("leaseToken"),
+                        payload.get("error"),
+                        payload.get("state", "cooldown"),
+                    )
+                    self._send_json(HTTPStatus.OK, {"job": remote_pool.get_job_payload(job)})
+                    return
+            except RemoteWorkerLimitError as error:
+                self._send_error_json(HTTPStatus.TOO_MANY_REQUESTS, "worker_limit", str(error))
+                return
+            except RemoteWorkerLeaseError as error:
+                self._send_error_json(HTTPStatus.CONFLICT, "invalid_lease", str(error))
+                return
+            except ValueError as error:
+                self._send_error_json(HTTPStatus.BAD_REQUEST, "invalid_worker_request", str(error))
+                return
+
+            self._send_error_json(HTTPStatus.NOT_FOUND, "not_found", "Endpoint was not found.")
+
         def _wait_if_requested(self, job: XpJob, payload: dict[str, Any]) -> None:
             wait_seconds = self._get_wait_seconds(payload)
             if wait_seconds > 0 and job.state not in {"completed", "failed"}:
@@ -837,6 +1465,17 @@ def create_request_handler(runtime: ServerRuntime) -> type[BaseHTTPRequestHandle
             if runtime.is_authorized(supplied_key):
                 return True
             self._send_error_json(HTTPStatus.UNAUTHORIZED, "unauthorized", "A valid X-Api-Key header is required.")
+            return False
+
+        def _require_worker_authorization(self) -> bool:
+            supplied_key = self.headers.get("X-Worker-Key")
+            if runtime.is_worker_authorized(supplied_key):
+                return True
+            self._send_error_json(
+                HTTPStatus.UNAUTHORIZED,
+                "unauthorized_worker",
+                "A valid X-Worker-Key header is required.",
+            )
             return False
 
         def _read_json_body(self) -> dict[str, Any]:
@@ -896,6 +1535,7 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
     )
 
 
