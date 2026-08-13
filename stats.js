@@ -314,23 +314,44 @@ function withTimeout(promise, timeoutMilliseconds, label) {
 
 function parseCurrentXp(profile, steamId) {
     const rawXp = Number(profile && profile.player_cur_xp);
+    const rawLevel = Number(profile && profile.player_level);
+
     if (!Number.isFinite(rawXp)) {
-        throw new Error('Steam did not return player_cur_xp for this CS2 profile.');
+        throw new Error(
+            `Steam did not return player_cur_xp. ` +
+            `steamId=${steamId}, rawXp=${profile && profile.player_cur_xp}, ` +
+            `playerLevel=${profile && profile.player_level}`
+        );
     }
 
     const currentXp = rawXp - XP_BASE;
+
     if (currentXp < 0 || currentXp > XP_PER_LEVEL) {
-        throw new Error('Steam returned an unsupported CS2 Current XP value.');
+        throw new Error(
+            `Unsupported CS2 XP: ` +
+            `steamId=${steamId}, ` +
+            `rawXp=${rawXp}, ` +
+            `currentXp=${currentXp}, ` +
+            `playerLevel=${Number.isFinite(rawLevel) ? rawLevel : 'null'}, ` +
+            `XP_BASE=${XP_BASE}`
+        );
     }
 
-    const profileLevel = Number(profile && profile.player_level);
+    const profileLevel =
+        Number.isFinite(rawLevel)
+            ? rawLevel
+            : null;
+
     return {
         steamId,
         currentXp,
         xpPerLevel: XP_PER_LEVEL,
-        progressPercent: Number(((currentXp / XP_PER_LEVEL) * 100).toFixed(2)),
+        progressPercent: Number(
+            ((currentXp / XP_PER_LEVEL) * 100).toFixed(2)
+        ),
         xpRemaining: XP_PER_LEVEL - currentXp,
-        profileLevel: Number.isFinite(profileLevel) ? profileLevel : null,
+        profileLevel,
+        rawXp,
         fetchedAt: new Date().toISOString()
     };
 }
