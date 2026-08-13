@@ -514,9 +514,17 @@ class StatsWorkerProcess:
                 message_type = str(message.get("type", "")).strip()
                 if message_type == "status":
                     with self._state_lock:
+                        previous_state = self._state
                         self._state = str(message.get("state") or "unknown")
                         detail = message.get("error")
                         self._last_error = str(detail) if detail else None
+                    if previous_state != self._state or detail:
+                        LOGGER.info(
+                            "Stats worker state: account=%s state=%s error=%s",
+                            self.account_name,
+                            self._state,
+                            self._last_error,
+                        )
                     continue
 
                 request_id = str(message.get("id") or "").strip()
@@ -687,6 +695,14 @@ class XpWorkerPool:
             job.state = "running"
             job.started_at = utc_now()
             job.attempts += 1
+            worker = self._workers[worker_index]
+            LOGGER.info(
+                "XP job assigned: job=%s steamId=%s worker=%s attempt=%s",
+                job.id,
+                job.steam_id,
+                worker.account_name,
+                job.attempts,
+            )
             self._executor.submit(self._run_job, worker_index, job)
 
     def _next_available_worker_index_locked(self) -> int | None:
@@ -746,6 +762,13 @@ class XpWorkerPool:
             job.finished_at = utc_now()
             job.error = None
             job.completed.set()
+            LOGGER.info(
+                "XP job completed: job=%s steamId=%s worker=%s attempt=%s",
+                job.id,
+                job.steam_id,
+                worker.account_name,
+                job.attempts,
+            )
             self._pending_by_steam_id.pop(job.steam_id, None)
             self._cache[job.steam_id] = CachedResult(
                 result=result,
@@ -758,10 +781,20 @@ class XpWorkerPool:
 
     def _finish_error(self, worker_index: int, job: XpJob, error: Exception) -> None:
         detail = str(error) or error.__class__.__name__
+        worker = self._workers[worker_index]
         with self._lock:
             self._busy_workers.discard(worker_index)
             job.error = detail
             should_retry = not self._stopped and job.attempts < self._config["maxAttemptsPerJob"]
+            LOGGER.warning(
+                "XP job failed: job=%s steamId=%s worker=%s attempt=%s retry=%s error=%s",
+                job.id,
+                job.steam_id,
+                worker.account_name,
+                job.attempts,
+                should_retry,
+                detail,
+            )
             if should_retry:
                 job.state = "queued"
                 threading.Timer(self._config["retryDelaySeconds"], self._requeue_job, args=(job,)).start()
