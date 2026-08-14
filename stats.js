@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const readline = require('readline');
 
@@ -16,7 +17,11 @@ const DEFAULT_CONFIG = {
     profileRequestTimeoutMs: 20000,
     minRequestIntervalMs: 1200,
     reconnectBaseDelayMs: 5000,
-    reconnectMaxDelayMs: 60000
+    reconnectMaxDelayMs: 60000,
+    remoteServerUrl: '',
+    workerApiKeyEnv: 'SWI_STATS_WORKER_API_KEY',
+    agentPollIntervalMs: 1000,
+    agentRequestTimeoutMs: 15000
 };
 
 function writeStderr(message) {
@@ -30,9 +35,10 @@ function writeProtocol(message) {
 function printUsage() {
     console.log('Usage:');
     console.log('  node stats.js --stdio --account worker_name --config stats-worker-config.json');
+    console.log('  node stats.js --remote-agent --account worker_name --config stats-worker-config.json --remote-server https://stats.example');
     console.log();
-    console.log('The process accepts JSON Lines on stdin and writes JSON Lines to stdout.');
-    console.log('It is intended to be launched by stats_server/server.py, not manually.');
+    console.log('--stdio accepts JSON Lines on stdin and writes JSON Lines to stdout.');
+    console.log('--remote-agent keeps Steam credentials local and exchanges jobs with server.py over HTTPS.');
 }
 
 function parseArgs(argv) {
@@ -40,7 +46,12 @@ function parseArgs(argv) {
         account: '',
         config: path.join(__dirname, 'stats-worker-config.json'),
         help: false,
-        stdio: false
+        stdio: false,
+        remoteAgent: false,
+        remoteServer: '',
+        workerApiKeyEnv: '',
+        agentId: '',
+        agentPollIntervalMs: null
     };
 
     for (let index = 0; index < argv.length; index += 1) {
@@ -54,6 +65,10 @@ function parseArgs(argv) {
             result.stdio = true;
             continue;
         }
+        if (argument === '--remote-agent') {
+            result.remoteAgent = true;
+            continue;
+        }
         if (argument === '--account' && argv[index + 1]) {
             result.account = argv[index + 1].trim();
             index += 1;
@@ -61,6 +76,26 @@ function parseArgs(argv) {
         }
         if (argument === '--config' && argv[index + 1]) {
             result.config = argv[index + 1].trim();
+            index += 1;
+            continue;
+        }
+        if (argument === '--remote-server' && argv[index + 1]) {
+            result.remoteServer = argv[index + 1].trim();
+            index += 1;
+            continue;
+        }
+        if (argument === '--worker-api-key-env' && argv[index + 1]) {
+            result.workerApiKeyEnv = argv[index + 1].trim();
+            index += 1;
+            continue;
+        }
+        if (argument === '--agent-id' && argv[index + 1]) {
+            result.agentId = argv[index + 1].trim();
+            index += 1;
+            continue;
+        }
+        if (argument === '--agent-poll-interval-ms' && argv[index + 1]) {
+            result.agentPollIntervalMs = argv[index + 1].trim();
             index += 1;
             continue;
         }
@@ -156,10 +191,14 @@ function loadConfig(configPath) {
         'profileRequestTimeoutMs',
         'minRequestIntervalMs',
         'reconnectBaseDelayMs',
-        'reconnectMaxDelayMs'
+        'reconnectMaxDelayMs',
+        'agentPollIntervalMs',
+        'agentRequestTimeoutMs'
     ]) {
         config[settingName] = assertPositiveInteger(config[settingName], settingName, settingName === 'minRequestIntervalMs');
     }
+    config.remoteServerUrl = String(config.remoteServerUrl || '').trim().replace(/\/+$/, '');
+    config.workerApiKeyEnv = String(config.workerApiKeyEnv || '').trim();
 
     return config;
 }
@@ -312,6 +351,68 @@ function withTimeout(promise, timeoutMilliseconds, label) {
     return Promise.race([promise, timeout]).finally(() => clearTimeout(timeoutId));
 }
 
+function parseCurrentXp(profile, steamId) {
+    const rawXpValue = profile ? profile.player_cur_xp : undefined;
+    const rawLevelValue = profile ? profile.player_level : undefined;
+
+    if (
+        rawXpValue === null ||
+        rawXpValue === undefined ||
+        (typeof rawXpValue === 'string' && !rawXpValue.trim())
+    ) {
+        throw new Error('Steam did not return player_cur_xp for this CS2 profile.');
+    }
+
+    const rawXp = Number(rawXpValue);
+    if (!Number.isFinite(rawXp)) {
+        throw new Error('Steam returned an invalid player_cur_xp value.');
+    }
+
+    let profileLevel = null;
+    if (
+        rawLevelValue !== null &&
+        rawLevelValue !== undefined &&
+        !(typeof rawLevelValue === 'string' && !rawLevelValue.trim())
+    ) {
+        const parsedLevel = Number(rawLevelValue);
+        if (Number.isFinite(parsedLevel)) {
+            profileLevel = parsedLevel;
+        }
+    }
+
+    // A truly uninitialized CS2 profile: Steam explicitly reports both XP=0 and level=0.
+    if (rawXp === 0 && (profileLevel === null || profileLevel === 0)) {
+        return {
+            steamId,
+            currentXp: 0,
+            xpPerLevel: XP_PER_LEVEL,
+            progressPercent: 0,
+            xpRemaining: XP_PER_LEVEL,
+            profileLevel: 0,
+            zeroProfile: true,
+            fetchedAt: new Date().toISOString()
+        };
+    }
+
+    const currentXp = rawXp - XP_BASE;
+    if (currentXp < 0 || currentXp > XP_PER_LEVEL) {
+        throw new Error(
+            `Steam returned an unsupported CS2 Current XP value: rawXp=${rawXp}, profileLevel=${profileLevel}`
+        );
+    }
+
+    return {
+        steamId,
+        currentXp,
+        xpPerLevel: XP_PER_LEVEL,
+        progressPercent: Number(((currentXp / XP_PER_LEVEL) * 100).toFixed(2)),
+        xpRemaining: XP_PER_LEVEL - currentXp,
+        profileLevel,
+        zeroProfile: false,
+        fetchedAt: new Date().toISOString()
+    };
+}
+
 class SteamStatsWorker {
     constructor(context, config, SteamUser, NodeCS2) {
         this.context = context;
@@ -330,6 +431,7 @@ class SteamStatsWorker {
         this.usedPasswordFallback = false;
         this.stopping = false;
         this.loginMode = '';
+        this.lastError = null;
     }
 
     start() {
@@ -354,6 +456,27 @@ class SteamStatsWorker {
     enqueue(request) {
         this.pendingRequests.push(request);
         this._processNext();
+    }
+
+    async requestProfile(steamId) {
+        if (this.stopping) {
+            throw new Error('Worker stopped.');
+        }
+        if (this.state !== 'ready') {
+            throw new Error(`Worker is not ready (state: ${this.state}).`);
+        }
+
+        this._setState('busy');
+        try {
+            return await this._fetch({ steamId });
+        } catch (error) {
+            this._scheduleReconnect(error);
+            throw error;
+        } finally {
+            if (!this.stopping && this.state === 'busy') {
+                this._setState('ready');
+            }
+        }
     }
 
     _connect(preferPassword) {
@@ -577,11 +700,12 @@ class SteamStatsWorker {
             return;
         }
         this.state = nextState;
+        this.lastError = error ? String(error.message || error) : null;
         writeProtocol({
             type: 'status',
             account: this.context.accountName,
             state: nextState,
-            error: error ? String(error.message || error) : null
+            error: this.lastError
         });
     }
 }
@@ -602,6 +726,227 @@ function validateRequest(message) {
     return { id: requestId, steamId };
 }
 
+class RemoteAgentHttpError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+    }
+}
+
+function createDefaultAgentId(accountName) {
+    const machineName = process.env.COMPUTERNAME || os.hostname() || 'local';
+    const digest = crypto
+        .createHash('sha256')
+        .update(`${machineName}\u0000${accountName}`, 'utf8')
+        .digest('hex')
+        .slice(0, 24);
+    return `swi-${digest}`;
+}
+
+function resolveRemoteAgentOptions(args, config) {
+    const serverUrl = String(
+        args.remoteServer || config.remoteServerUrl || process.env.SWI_STATS_SERVER_URL || ''
+    ).trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(serverUrl)) {
+        throw new Error('A remote server URL starting with http:// or https:// is required.');
+    }
+
+    const workerApiKeyEnv = String(args.workerApiKeyEnv || config.workerApiKeyEnv || '').trim();
+    if (!workerApiKeyEnv) {
+        throw new Error('workerApiKeyEnv is required for --remote-agent.');
+    }
+    const workerApiKey = String(process.env[workerApiKeyEnv] || '').trim();
+    if (!workerApiKey) {
+        throw new Error(`Environment variable ${workerApiKeyEnv} is required for --remote-agent.`);
+    }
+
+    const agentId = String(args.agentId || createDefaultAgentId(args.account)).trim();
+    if (!/^[A-Za-z0-9._-]{1,80}$/.test(agentId)) {
+        throw new Error('agentId must contain only letters, numbers, ".", "_" or "-".');
+    }
+
+    const rawPollInterval = args.agentPollIntervalMs === null
+        ? config.agentPollIntervalMs
+        : args.agentPollIntervalMs;
+    const pollIntervalMs = assertPositiveInteger(rawPollInterval, 'agentPollIntervalMs', true);
+
+    return {
+        serverUrl,
+        workerApiKey,
+        agentId,
+        accountName: args.account,
+        pollIntervalMs,
+        requestTimeoutMs: config.agentRequestTimeoutMs
+    };
+}
+
+async function postRemoteAgentJson(options, endpoint, payload) {
+    if (typeof globalThis.fetch !== 'function') {
+        throw new Error('Node.js 18 or newer is required for --remote-agent.');
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), options.requestTimeoutMs);
+    let response;
+    try {
+        response = await globalThis.fetch(`${options.serverUrl}${endpoint}`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Worker-Key': options.workerApiKey
+            },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        });
+    } catch (error) {
+        const detail = error && error.name === 'AbortError'
+            ? `request timed out after ${options.requestTimeoutMs} ms`
+            : String(error && error.message || error);
+        throw new Error(`Remote worker request failed: ${detail}`);
+    } finally {
+        clearTimeout(timeout);
+    }
+
+    let responsePayload;
+    try {
+        responsePayload = await response.json();
+    } catch {
+        throw new RemoteAgentHttpError(response.status, `Server returned invalid JSON (HTTP ${response.status}).`);
+    }
+
+    if (!response.ok) {
+        const errorData = responsePayload && responsePayload.error;
+        const detail = errorData && typeof errorData === 'object'
+            ? String(errorData.message || errorData.code || 'Unknown server error')
+            : 'Unknown server error';
+        throw new RemoteAgentHttpError(response.status, detail);
+    }
+    return responsePayload;
+}
+
+class RemoteStatsAgent {
+    constructor(worker, options) {
+        this.worker = worker;
+        this.options = options;
+        this.stopping = false;
+    }
+
+    async run() {
+        this.worker.start();
+        while (!this.stopping) {
+            if (this.worker.state !== 'ready') {
+                await this._registerWorker();
+                await delay(this.options.pollIntervalMs);
+                continue;
+            }
+
+            let nextPayload;
+            try {
+                nextPayload = await postRemoteAgentJson(
+                    this.options,
+                    '/v1/worker/next',
+                    this._workerPayload()
+                );
+            } catch (error) {
+                this._throwIfFatalServerError(error);
+                writeStderr(`Could not get a remote job: ${error.message || error}`);
+                await delay(this.options.pollIntervalMs);
+                continue;
+            }
+
+            const assignment = nextPayload && nextPayload.job;
+            if (!assignment || typeof assignment !== 'object') {
+                await delay(this.options.pollIntervalMs);
+                continue;
+            }
+            await this._processAssignment(assignment);
+        }
+    }
+
+    stop() {
+        this.stopping = true;
+        this.worker.stop();
+    }
+
+    _workerPayload() {
+        return {
+            agentId: this.options.agentId,
+            accountName: this.options.accountName,
+            state: this.worker.state,
+            error: this.worker.lastError
+        };
+    }
+
+    async _registerWorker() {
+        try {
+            await postRemoteAgentJson(
+                this.options,
+                '/v1/worker/register',
+                this._workerPayload()
+            );
+        } catch (error) {
+            this._throwIfFatalServerError(error);
+            writeStderr(`Could not register remote worker: ${error.message || error}`);
+        }
+    }
+
+    async _processAssignment(assignment) {
+        const jobId = String(assignment.id || '').trim();
+        const steamId = String(assignment.steamId || '').trim();
+        const leaseToken = String(assignment.leaseToken || '').trim();
+        if (!jobId || !leaseToken || !/^7656\d{13}$/.test(steamId)) {
+            writeStderr('Server returned an invalid remote job assignment.');
+            await delay(this.options.pollIntervalMs);
+            return;
+        }
+
+        let endpoint;
+        let payload;
+        try {
+            const result = await this.worker.requestProfile(steamId);
+            endpoint = `/v1/worker/jobs/${encodeURIComponent(jobId)}/complete`;
+            payload = {
+                agentId: this.options.agentId,
+                leaseToken,
+                result
+            };
+        } catch (error) {
+            endpoint = `/v1/worker/jobs/${encodeURIComponent(jobId)}/failed`;
+            payload = {
+                agentId: this.options.agentId,
+                leaseToken,
+                state: this.worker.state,
+                error: String(error && error.message || error)
+            };
+        }
+
+        await this._reportJobOutcome(endpoint, payload);
+    }
+
+    async _reportJobOutcome(endpoint, payload) {
+        while (!this.stopping) {
+            try {
+                await postRemoteAgentJson(this.options, endpoint, payload);
+                return;
+            } catch (error) {
+                if (error instanceof RemoteAgentHttpError && error.status === 409) {
+                    writeStderr(`Remote job lease is no longer active: ${error.message}`);
+                    return;
+                }
+                this._throwIfFatalServerError(error);
+                writeStderr(`Could not report remote job outcome: ${error.message || error}`);
+                await delay(this.options.pollIntervalMs);
+            }
+        }
+    }
+
+    _throwIfFatalServerError(error) {
+        if (error instanceof RemoteAgentHttpError && [400, 401, 404].includes(error.status)) {
+            throw error;
+        }
+    }
+}
+
 function run() {
     let args;
     try {
@@ -616,8 +961,8 @@ function run() {
         printUsage();
         return;
     }
-    if (!args.stdio || !args.account) {
-        writeStderr('--stdio and --account are required.');
+    if ((!args.stdio && !args.remoteAgent) || !args.account || (args.stdio && args.remoteAgent)) {
+        writeStderr('Choose exactly one of --stdio or --remote-agent, and provide --account.');
         process.exitCode = 2;
         return;
     }
@@ -639,6 +984,27 @@ function run() {
     }
 
     const worker = new SteamStatsWorker(context, config, SteamUser, NodeCS2);
+    if (args.remoteAgent) {
+        let options;
+        try {
+            options = resolveRemoteAgentOptions(args, config);
+        } catch (error) {
+            writeStderr(error.message);
+            process.exitCode = 2;
+            return;
+        }
+
+        const agent = new RemoteStatsAgent(worker, options);
+        process.on('SIGINT', () => agent.stop());
+        process.on('SIGTERM', () => agent.stop());
+        agent.run().catch((error) => {
+            writeStderr(`Remote agent stopped: ${error.message || error}`);
+            agent.stop();
+            process.exitCode = 1;
+        });
+        return;
+    }
+
     const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 
     input.on('line', (line) => {
@@ -658,4 +1024,8 @@ function run() {
     worker.start();
 }
 
-run();
+if (require.main === module) {
+    run();
+}
+
+module.exports = { parseCurrentXp };
