@@ -352,36 +352,44 @@ function withTimeout(promise, timeoutMilliseconds, label) {
 }
 
 function parseCurrentXp(profile, steamId) {
-    const rawXpValue = profile ? profile.player_cur_xp : undefined;
-    const rawLevelValue = profile ? profile.player_level : undefined;
+    const rawXpValue =
+        profile ? profile.player_cur_xp : undefined;
 
-    if (
-        rawXpValue === null ||
-        rawXpValue === undefined ||
-        (typeof rawXpValue === 'string' && !rawXpValue.trim())
-    ) {
-        throw new Error('Steam did not return player_cur_xp for this CS2 profile.');
-    }
+    const rawLevelValue =
+        profile ? profile.player_level : undefined;
 
-    const rawXp = Number(rawXpValue);
-    if (!Number.isFinite(rawXp)) {
-        throw new Error('Steam returned an invalid player_cur_xp value.');
-    }
+    const hasXp =
+        rawXpValue !== null &&
+        rawXpValue !== undefined &&
+        !(
+            typeof rawXpValue === 'string' &&
+            !rawXpValue.trim()
+        );
 
-    let profileLevel = null;
-    if (
+    const hasLevel =
         rawLevelValue !== null &&
         rawLevelValue !== undefined &&
-        !(typeof rawLevelValue === 'string' && !rawLevelValue.trim())
-    ) {
-        const parsedLevel = Number(rawLevelValue);
-        if (Number.isFinite(parsedLevel)) {
-            profileLevel = parsedLevel;
-        }
-    }
+        !(
+            typeof rawLevelValue === 'string' &&
+            !rawLevelValue.trim()
+        );
 
-    // A truly uninitialized CS2 profile: Steam explicitly reports both XP=0 and level=0.
-    if (rawXp === 0 && (profileLevel === null || profileLevel === 0)) {
+    const profileLevel = hasLevel
+        ? Number(rawLevelValue)
+        : null;
+
+    // Новый / ещё не инициализированный CS2-профиль.
+    //
+    // Steam может вообще не прислать player_cur_xp.
+    // Если при этом Level тоже отсутствует или равен 0,
+    // считаем профиль нулевым.
+    if (
+        !hasXp &&
+        (
+            profileLevel === null ||
+            profileLevel === 0
+        )
+    ) {
         return {
             steamId,
             currentXp: 0,
@@ -390,14 +398,51 @@ function parseCurrentXp(profile, steamId) {
             xpRemaining: XP_PER_LEVEL,
             profileLevel: 0,
             zeroProfile: true,
+            inferredZeroProfile: true,
+            fetchedAt: new Date().toISOString()
+        };
+    }
+
+    if (!hasXp) {
+        throw new Error(
+            `Steam did not return player_cur_xp. ` +
+            `playerLevel=${profileLevel}`
+        );
+    }
+
+    const rawXp = Number(rawXpValue);
+
+    if (!Number.isFinite(rawXp)) {
+        throw new Error(
+            'Steam returned an invalid player_cur_xp value.'
+        );
+    }
+
+    // Steam явно вернул XP = 0.
+    if (rawXp === 0) {
+        return {
+            steamId,
+            currentXp: 0,
+            xpPerLevel: XP_PER_LEVEL,
+            progressPercent: 0,
+            xpRemaining: XP_PER_LEVEL,
+            profileLevel: 0,
+            zeroProfile: true,
+            inferredZeroProfile: false,
             fetchedAt: new Date().toISOString()
         };
     }
 
     const currentXp = rawXp - XP_BASE;
-    if (currentXp < 0 || currentXp > XP_PER_LEVEL) {
+
+    if (
+        currentXp < 0 ||
+        currentXp > XP_PER_LEVEL
+    ) {
         throw new Error(
-            `Steam returned an unsupported CS2 Current XP value: rawXp=${rawXp}, profileLevel=${profileLevel}`
+            `Steam returned unsupported CS2 XP: ` +
+            `rawXp=${rawXp}, ` +
+            `playerLevel=${profileLevel}`
         );
     }
 
@@ -405,10 +450,23 @@ function parseCurrentXp(profile, steamId) {
         steamId,
         currentXp,
         xpPerLevel: XP_PER_LEVEL,
-        progressPercent: Number(((currentXp / XP_PER_LEVEL) * 100).toFixed(2)),
-        xpRemaining: XP_PER_LEVEL - currentXp,
-        profileLevel,
+        progressPercent: Number(
+            (
+                currentXp /
+                XP_PER_LEVEL *
+                100
+            ).toFixed(2)
+        ),
+        xpRemaining:
+            XP_PER_LEVEL - currentXp,
+
+        profileLevel:
+            Number.isFinite(profileLevel)
+                ? profileLevel
+                : null,
+
         zeroProfile: false,
+        inferredZeroProfile: false,
         fetchedAt: new Date().toISOString()
     };
 }
