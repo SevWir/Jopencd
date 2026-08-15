@@ -62,6 +62,14 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "accounts": [],
         "requestTimeoutSeconds": 40,
         "restartDelaySeconds": 3,
+        # Start local Steam workers one by one instead of logging all accounts in at once.
+        "startupSequential": True,
+        "startupReadyTimeoutSeconds": 45,
+        "startupGapSeconds": 5,
+        # If Steam explicitly throttles login attempts, slow down the next account.
+        "throttlePauseSeconds": 60,
+        # A crashed worker process is restarted later, one worker at a time.
+        "failedWorkerRestartSeconds": 300,
     },
     "remoteWorkers": {
         "workerApiKeyEnv": "SWI_STATS_WORKER_API_KEY",
@@ -228,6 +236,27 @@ def load_config(config_path: Path) -> dict[str, Any]:
         worker_config["restartDelaySeconds"] = as_positive_number(
             worker_config["restartDelaySeconds"], "statsWorker.restartDelaySeconds", allow_zero=True
         )
+        worker_config["startupSequential"] = bool(worker_config.get("startupSequential", True))
+        worker_config["startupReadyTimeoutSeconds"] = as_positive_number(
+            worker_config.get("startupReadyTimeoutSeconds", 45),
+            "statsWorker.startupReadyTimeoutSeconds",
+            allow_zero=True,
+        )
+        worker_config["startupGapSeconds"] = as_positive_number(
+            worker_config.get("startupGapSeconds", 5),
+            "statsWorker.startupGapSeconds",
+            allow_zero=True,
+        )
+        worker_config["throttlePauseSeconds"] = as_positive_number(
+            worker_config.get("throttlePauseSeconds", 60),
+            "statsWorker.throttlePauseSeconds",
+            allow_zero=True,
+        )
+        worker_config["failedWorkerRestartSeconds"] = as_positive_number(
+            worker_config.get("failedWorkerRestartSeconds", 300),
+            "statsWorker.failedWorkerRestartSeconds",
+            allow_zero=True,
+        )
 
         account_names = worker_config.get("accounts")
         if not isinstance(account_names, list):
@@ -370,6 +399,7 @@ class StatsWorkerProcess:
         self._last_start_at = 0.0
         self._state = "stopped"
         self._last_error: str | None = None
+        self._last_stderr_line: str | None = None
 
     @property
     def state(self) -> str:
@@ -387,6 +417,22 @@ class StatsWorkerProcess:
             "state": self.state,
             "lastError": self.last_error,
         }
+
+    def wait_for_startup_state(self, timeout_seconds: float) -> tuple[str, str | None]:
+        """Wait until the worker is READY or reaches a useful error/cooldown state."""
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        while True:
+            state = self.state
+            error = self.last_error
+            if state in {"ready", "cooldown", "failed", "stopped"}:
+                return state, error
+            if time.monotonic() >= deadline:
+                return state, error
+            time.sleep(0.25)
+
+    def is_process_running(self) -> bool:
+        with self._state_lock:
+            return self._process is not None and self._process.poll() is None
 
     def start(self) -> None:
         with self._state_lock:
@@ -424,6 +470,7 @@ class StatsWorkerProcess:
             self._last_start_at = time.monotonic()
             self._state = "starting"
             self._last_error = None
+            self._last_stderr_line = None
             process = self._process
             threading.Thread(target=self._read_stdout, args=(process,), daemon=True).start()
             threading.Thread(target=self._read_stderr, args=(process,), daemon=True).start()
@@ -540,7 +587,12 @@ class StatsWorkerProcess:
                 is_current_process = self._process is process
             if is_current_process:
                 exit_code = process.poll()
-                self._mark_failed(f"Stats worker exited with code {exit_code}.")
+                detail = f"Stats worker exited with code {exit_code}."
+                with self._state_lock:
+                    last_stderr = self._last_stderr_line
+                if last_stderr:
+                    detail += f" Last stderr: {last_stderr}"
+                self._mark_failed(detail)
 
     def _read_stderr(self, process: subprocess.Popen[str]) -> None:
         if process.stderr is None:
@@ -549,6 +601,8 @@ class StatsWorkerProcess:
         for raw_line in process.stderr:
             line = raw_line.strip()
             if line:
+                with self._state_lock:
+                    self._last_stderr_line = line[-1000:]
                 LOGGER.warning("stats[%s]: %s", self.account_name, line)
 
     def _mark_failed(self, detail: str) -> None:
@@ -577,6 +631,9 @@ class XpWorkerPool:
         self._busy_workers: set[int] = set()
         self._round_robin_index = 0
         self._dispatch_retry_timer: threading.Timer | None = None
+        self._startup_stop_event = threading.Event()
+        self._startup_thread: threading.Thread | None = None
+        self._supervisor_thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=len(workers), thread_name_prefix="xp-worker"
@@ -584,16 +641,43 @@ class XpWorkerPool:
         self._stopped = False
 
     def start(self) -> None:
-        for worker in self._workers:
-            try:
-                worker.start()
-            except RuntimeError as error:
-                LOGGER.warning("Worker %s did not start yet: %s", worker.account_name, error)
+        """Start workers without creating a burst of simultaneous Steam logins."""
+        if self._stopped:
+            return
+
+        sequential = bool(self._config.get("startupSequential", True))
+        if not sequential:
+            for worker in self._workers:
+                try:
+                    worker.start()
+                except RuntimeError as error:
+                    LOGGER.warning("Worker %s did not start yet: %s", worker.account_name, error)
+            return
+
+        with self._lock:
+            if self._startup_thread is not None and self._startup_thread.is_alive():
+                return
+            self._startup_stop_event.clear()
+            self._startup_thread = threading.Thread(
+                target=self._start_workers_sequentially,
+                name="steam-worker-startup",
+                daemon=True,
+            )
+            self._startup_thread.start()
+
+            if self._supervisor_thread is None or not self._supervisor_thread.is_alive():
+                self._supervisor_thread = threading.Thread(
+                    target=self._supervise_failed_workers,
+                    name="steam-worker-supervisor",
+                    daemon=True,
+                )
+                self._supervisor_thread.start()
 
     def stop(self) -> None:
         retry_timer = None
         with self._lock:
             self._stopped = True
+            self._startup_stop_event.set()
             retry_timer = self._dispatch_retry_timer
             self._dispatch_retry_timer = None
         if retry_timer is not None:
@@ -601,6 +685,104 @@ class XpWorkerPool:
         for worker in self._workers:
             worker.stop()
         self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _start_workers_sequentially(self) -> None:
+        total = len(self._workers)
+        ready_timeout = float(self._config.get("startupReadyTimeoutSeconds", 45))
+        normal_gap = float(self._config.get("startupGapSeconds", 5))
+        throttle_pause = float(self._config.get("throttlePauseSeconds", 60))
+
+        LOGGER.info(
+            "Sequential Steam worker startup enabled: workers=%s readyTimeout=%ss gap=%ss throttlePause=%ss",
+            total,
+            ready_timeout,
+            normal_gap,
+            throttle_pause,
+        )
+
+        for position, worker in enumerate(self._workers, start=1):
+            if self._startup_stop_event.is_set() or self._stopped:
+                return
+
+            LOGGER.info(
+                "Starting Steam worker %s/%s: %s",
+                position,
+                total,
+                worker.account_name,
+            )
+
+            try:
+                worker.start()
+            except RuntimeError as error:
+                LOGGER.warning("Worker %s could not start: %s", worker.account_name, error)
+
+            state, error = worker.wait_for_startup_state(ready_timeout)
+            LOGGER.info(
+                "Steam worker startup result: account=%s state=%s error=%s",
+                worker.account_name,
+                state,
+                error,
+            )
+
+            pause = normal_gap
+            if error and "AccountLoginDeniedThrottle" in error:
+                pause = max(normal_gap, throttle_pause)
+                LOGGER.warning(
+                    "Steam login throttle detected for %s; waiting %.0f seconds before starting the next account.",
+                    worker.account_name,
+                    pause,
+                )
+
+            if position < total and pause > 0:
+                if self._startup_stop_event.wait(pause):
+                    return
+
+        LOGGER.info("Initial sequential Steam worker startup pass finished.")
+        with self._lock:
+            self._dispatch_locked()
+
+    def _supervise_failed_workers(self) -> None:
+        restart_interval = float(self._config.get("failedWorkerRestartSeconds", 300))
+        if restart_interval <= 0:
+            return
+
+        # Give the initial sequential startup pass time to do its job first.
+        if self._startup_stop_event.wait(max(10.0, restart_interval)):
+            return
+
+        while not self._startup_stop_event.is_set() and not self._stopped:
+            restarted_one = False
+            for worker in self._workers:
+                if self._startup_stop_event.is_set() or self._stopped:
+                    return
+                if worker.state not in {"failed", "stopped"}:
+                    continue
+                if worker.is_process_running():
+                    continue
+
+                LOGGER.warning("Restarting failed Steam worker: %s", worker.account_name)
+                try:
+                    worker.start()
+                    state, error = worker.wait_for_startup_state(
+                        float(self._config.get("startupReadyTimeoutSeconds", 45))
+                    )
+                    LOGGER.info(
+                        "Restarted Steam worker result: account=%s state=%s error=%s",
+                        worker.account_name,
+                        state,
+                        error,
+                    )
+                except RuntimeError as error:
+                    LOGGER.warning("Failed worker %s could not restart: %s", worker.account_name, error)
+                restarted_one = True
+                break
+
+            with self._lock:
+                self._dispatch_locked()
+
+            wait_seconds = restart_interval if restarted_one else min(60.0, restart_interval)
+            if self._startup_stop_event.wait(wait_seconds):
+                return
 
     def submit(self, steam_id: str) -> XpJob:
         return self.submit_many([steam_id])[0]
@@ -1247,7 +1429,15 @@ class ServerRuntime:
                 )
                 for account_name in worker_config["accounts"]
             ]
-            self.pool: XpWorkerPool | RemoteXpWorkerPool = XpWorkerPool(workers, config["pool"])
+            local_pool_config = {
+                **config["pool"],
+                "startupSequential": worker_config.get("startupSequential", True),
+                "startupReadyTimeoutSeconds": worker_config.get("startupReadyTimeoutSeconds", 45),
+                "startupGapSeconds": worker_config.get("startupGapSeconds", 5),
+                "throttlePauseSeconds": worker_config.get("throttlePauseSeconds", 60),
+                "failedWorkerRestartSeconds": worker_config.get("failedWorkerRestartSeconds", 300),
+            }
+            self.pool: XpWorkerPool | RemoteXpWorkerPool = XpWorkerPool(workers, local_pool_config)
         else:
             self.pool = RemoteXpWorkerPool(config["pool"], config["remoteWorkers"])
         api_key_env = str(config["server"].get("apiKeyEnv", ""))
