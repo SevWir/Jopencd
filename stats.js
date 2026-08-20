@@ -280,27 +280,69 @@ function saveRefreshToken(cacheFile, accountName, refreshToken, steamId) {
 
 function loadAccountContext(accountName, config) {
     const maFile = findMaFile(accountName, config.maFileDirectories);
+
     if (!maFile) {
-        throw new Error(`maFile was not found for worker account ${accountName}.`);
+        throw new Error(
+            `maFile was not found for worker account ${accountName}.`
+        );
     }
 
     const credentials = loadCredentials(config.credentialsFile);
     const tokenCache = loadTokenCache(config.authCacheFile);
-    const tokenEntry = tokenCache[accountName] && typeof tokenCache[accountName] === 'object'
-        ? tokenCache[accountName]
-        : {};
-    const session = maFile.data.Session && typeof maFile.data.Session === 'object'
-        ? maFile.data.Session
-        : {};
-    const sharedSecret = String(maFile.data.shared_secret || '').trim();
-    const password = credentials.get(accountName) || '';
-    const refreshToken = String(tokenEntry.clientRefreshToken || '').trim();
+
+    const tokenEntry =
+        tokenCache[accountName] &&
+        typeof tokenCache[accountName] === 'object'
+            ? tokenCache[accountName]
+            : {};
+
+    const session =
+        maFile.data.Session &&
+        typeof maFile.data.Session === 'object'
+            ? maFile.data.Session
+            : {};
+
+    const sharedSecret =
+        String(maFile.data.shared_secret || '').trim();
+
+    const password =
+        credentials.get(accountName) || '';
+
+    const refreshToken =
+        String(tokenEntry.clientRefreshToken || '').trim();
+
+    /*
+     * SteamID64 нельзя безопасно брать из JSON как Number:
+     * JavaScript может округлить 17-значный SteamID.
+     *
+     * Поэтому первым используем SteamID, который сохранили
+     * сами после входа в Steam как строку.
+     */
+    const cachedSteamId =
+        String(tokenEntry.steamId || '').trim();
+
+    /*
+     * Из maFile разрешаем SteamID только если он уже строка.
+     * Числовой SteamID игнорируем.
+     */
+    const maFileSteamId =
+        typeof session.SteamID === 'string'
+            ? session.SteamID.trim()
+            : '';
+
+    const steamId =
+        cachedSteamId || maFileSteamId;
 
     if (!refreshToken && !password) {
-        throw new Error(`No local password or saved client refresh token is available for ${accountName}.`);
+        throw new Error(
+            `No local password or saved client refresh token is available for ${accountName}.`
+        );
     }
+
     if (!sharedSecret && !refreshToken) {
-        throw new Error(`Steam Guard shared_secret is missing for ${accountName}.`);
+        throw new Error(
+            `Steam Guard shared_secret is missing for ${accountName}.`
+        );
     }
 
     return {
@@ -308,7 +350,7 @@ function loadAccountContext(accountName, config) {
         password,
         refreshToken,
         sharedSecret,
-        steamId: String(session.SteamID || tokenEntry.steamId || '').trim()
+        steamId
     };
 }
 
@@ -544,19 +586,27 @@ class SteamStatsWorker {
 
         clearTimeout(this.reconnectTimer);
         this.reconnectTimer = null;
+
         const generation = ++this.generation;
+
         this._disposeClients();
         this._setState('connecting');
 
         const user = new this.SteamUser({
             autoRelogin: false,
             renewRefreshTokens: true,
-            dataDirectory: path.join(this.config.steamDataDirectory, this.context.accountName)
+            dataDirectory: path.join(
+                this.config.steamDataDirectory,
+                this.context.accountName
+            )
         });
+
         const cs2 = new this.NodeCS2(user);
+
         this.user = user;
         this.cs2 = cs2;
         this.loginMode = '';
+
         if (!preferPassword) {
             this.usedPasswordFallback = false;
         }
@@ -564,24 +614,40 @@ class SteamStatsWorker {
         this._bindEvents(user, cs2, generation);
 
         try {
+            /*
+            * Если есть refresh token — Steam сам знает,
+            * какому SteamID принадлежит этот token.
+            *
+            * steamID специально НЕ передаём.
+            */
             if (!preferPassword && this.context.refreshToken) {
                 this.loginMode = 'refresh-token';
-                const details = { refreshToken: this.context.refreshToken };
-                if (this.context.steamId) {
-                    details.steamID = this.context.steamId;
-                }
-                user.logOn(details);
+
+                user.logOn({
+                    refreshToken: this.context.refreshToken
+                });
+
                 return;
             }
 
             if (!this.context.password) {
-                throw new Error('No password is available for fallback Steam login.');
+                throw new Error(
+                    'No password is available for fallback Steam login.'
+                );
             }
 
             this.loginMode = 'password';
-            user.logOn({ accountName: this.context.accountName, password: this.context.password });
+
+            user.logOn({
+                accountName: this.context.accountName,
+                password: this.context.password
+            });
+
         } catch (error) {
-            this._scheduleReconnect(error, generation);
+            this._scheduleReconnect(
+                error,
+                generation
+            );
         }
     }
 
